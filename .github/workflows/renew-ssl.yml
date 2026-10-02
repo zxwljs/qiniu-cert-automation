@@ -52,9 +52,16 @@ jobs:
 
       - name: 安装 acme.sh
         run: |
+          set -euo pipefail
+          # 必须显式传 email，acme.sh v3.1.6 在 email 为空时会安装失败
           curl -s https://get.acme.sh | sh -s email=${{ secrets.ACME_EMAIL }}
-          source ~/.acme.sh/acme.sh
-          acme.sh --set-default-ca --server letsencrypt
+          # 用绝对路径调用，不要 source 脚本、也不要依赖 bashrc 里的别名
+          # ——GitHub Actions 每个 step 都是独立 shell，bashrc 不会被加载
+          ACME="$HOME/.acme.sh/acme.sh"
+          chmod +x "$ACME"
+          "$ACME" --version
+          "$ACME" --set-default-ca --server letsencrypt
+          "$ACME" --info | head -20
 
       - name: 签发 / 续签证书（Cloudflare DNS-01 挑战）
         env:
@@ -63,7 +70,7 @@ jobs:
           CF_Zone_ID: ${{ secrets.CF_ZONE_ID }}
         run: |
           set -euo pipefail
-          source ~/.acme.sh/acme.sh
+          ACME="$HOME/.acme.sh/acme.sh"
 
           # 支持多个域名，逗号分隔
           IFS=',' read -ra DOMAIN_LIST <<< "${{ secrets.QINIU_DOMAIN }}"
@@ -99,14 +106,14 @@ jobs:
           # --server letsencrypt : 使用 Let's Encrypt 生产环境
           # --dns dns_cf          : 用 Cloudflare API 自动写 _acme-challenge TXT 记录
           # 不指定 --force 时，acme.sh 自己判断是否接近到期（默认剩余 30 天）
-          acme.sh --issue \
+          "$ACME" --issue \
             --server letsencrypt \
             $DOMAIN_ARGS \
             --dns dns_cf \
             $FORCE_FLAG
 
           # 装到固定路径，方便下游步骤引用
-          acme.sh --install-cert -d "$PRIMARY" \
+          "$ACME" --install-cert -d "$PRIMARY" \
             --fullchain-file "$CERT_DIR/fullchain.pem" \
             --key-file "$CERT_DIR/privkey.pem"
 
