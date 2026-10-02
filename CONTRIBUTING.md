@@ -53,6 +53,10 @@ acme.sh 安装器只把别名写进 bashrc，所以 `acme.sh --xxx` 必然 `comm
 **`set -euo pipefail` 环境下变量必须先赋值再用。**
 `ACME=...` 要写在 `set -e` 之后、`"$ACME"` 首次引用之前，否则 unbound variable 会直接中断。
 
+**不要给七牛的 `httpsconf` 接口传 `tlsVersions`。**
+文档写它是 `string`，但后端 Go 结构体是 `[]fusion.TlsVersion`，传字符串直接400。
+这是文档与实现不一致，不是我们的 bug。它是选填项，省掉即可。
+
 ## 提交信息
 
 用中文或英文都可以，说清楚改了什么、为什么。类型参考：

@@ -237,13 +237,18 @@ def upload_cert(cert_pem, key_pem):
 
 
 def bind_domain(domain, cert_id):
-    """把单个域名换绑到指定证书。"""
+    """把单个域名换绑到指定证书。
+
+    注意：这里刻意不传 tlsVersions。
+    七牛官方文档标注它是 string，但后端 Go 结构体实际是 []fusion.TlsVersion，
+    传字符串会报 "cannot unmarshal string into Go struct field"。
+    反正它是选填项，不传就走七牛默认策略，少一个踩坑点。
+    """
     path = f"/domain/{domain}/httpsconf"
     payload = {
         "certId": cert_id,
         "forceHttps": FORCE_HTTPS,
         "http2Enable": True,
-        "tlsVersions": "TLSv1.2",
     }
     return api_write("PUT", path, payload)
 
@@ -258,7 +263,15 @@ def bind_all_domains(cert_id):
             ok.append(domain)
         except Exception as e:
             err = str(e)
-            # 域名未绑定/未备案属配置问题，重试无意义
+            # 4xx 基本都是配置错误（域名未备案、参数类型不对），重试没意义，
+            # 直接抛出去终止，避免日志里刷一堆无效重试
+            if err.startswith("HTTP 4"):
+                die(
+                    f"域名 {domain} 换绑被拒绝: {err}\n"
+                    f"  证书已成功上传（certID={cert_id}），但换绑失败。\n"
+                    f"  常见原因：域名未在七牛备案（400020）、域名没绑定过、或参数格式不对。\n"
+                    f"  注意：下次重跑时若证书指纹未变会跳过上传，直接重试换绑即可。"
+                )
             log(f"  [FAIL] {domain} 换绑失败: {err}")
             failed.append((domain, err))
     if not ok:
@@ -347,19 +360,39 @@ def main():
     state = load_state()
     force = os.environ.get("FORCE_UPLOAD", "").strip().lower() in ("1", "true", "yes")
 
-    if state.get("fingerprint") == fingerprint and not force:
-        log("证书指纹与上次同步一致，跳过上传（强制重建请设 FORCE_UPLOAD=1）")
+    same_cert = state.get("fingerprint") == fingerprint
+
+    # 情况一：证书没变，且上次换绑也成功了 —— 什么都不用做
+    if same_cert and state.get("bound") and not force:
+        log("证书指纹与上次同步一致，换绑已完成，跳过（强制重建请设 FORCE_UPLOAD=1）")
         for d in DOMAINS:
             verify_online(d)
         return 0
 
-    cert_id = upload_cert(cert_pem, key_pem)
+    # 情况二：证书没变，但上次换绑失败了（或状态丢失）—— 复用已上传的 certID 直接重试，
+    # 避免在七牛里堆一叠重复证书
+    if same_cert and state.get("certId") and not force:
+        cert_id = state["certId"]
+        log(f"证书指纹一致，复用已上传的 certID={cert_id}，仅重试换绑")
+    else:
+        cert_id = upload_cert(cert_pem, key_pem)
+        # 先把 certID 落盘：换绑可能失败，但证书已经上传了，
+        # 下次重跑要靠这个 certID 复用，不能重复上传
+        save_state({
+            "fingerprint": fingerprint,
+            "certId": cert_id,
+            "domains": DOMAINS,
+            "uploadedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "bound": False,
+        })
+
     ok, failed = bind_all_domains(cert_id)
 
     save_state({
         "fingerprint": fingerprint,
         "certId": cert_id,
         "domains": DOMAINS,
+        "bound": True,
         "syncedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     })
 

@@ -199,6 +199,20 @@ GitHub Actions（每天定时）
 
 **清理旧证书只删名字以 `le-` 开头的**，绝不碰你手动上传的证书。
 
+**别传 `tlsVersions`。** 官方文档标注它是 `string`，但后端 Go 结构体实际是
+`[]fusion.TlsVersion`，传字符串会报：
+
+```
+json: cannot unmarshal string into Go struct field
+UpdateHttpsConfArgs.tlsVersions of type []fusion.TlsVersion
+```
+
+这是七牛文档与实现不一致。它是选填项，不传就走默认策略，少一个踩坑点。
+
+**换绑失败重跑不会产生重复证书。** 证书上传成功但换绑失败时，`certID` 会先落盘到状态文件
+并标记 `bound: false`；下次重跑检测到证书指纹一致就复用这个 `certID` 直接重试换绑，
+不会在七牛里堆一叠内容相同的证书。
+
 ## 本地调试
 
 不用等定时器，本地就能复现。注意不要把 AK/SK 写进代码或提交到仓库：
