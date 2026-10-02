@@ -1,0 +1,21 @@
+name: probe-qiniu-api
+
+# 一次性诊断：手动触发，把七牛所有疑似换绑端点打一遍，找出真正可用的那个。
+# 正常续签不需要跑它，只有换绑一直失败、想找正确接口时才用。
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Probe all candidate endpoints
+        env:
+          QINIU_AK: ${{ secrets.QINIU_AK }}
+          QINIU_SK: ${{ secrets.QINIU_SK }}
+          QINIU_DOMAIN: ${{ secrets.QINIU_DOMAIN }}
+        run: python3 scripts/probe-qiniu-api.py
