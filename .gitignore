@@ -1,0 +1,19 @@
+# 证书与密钥 —— 绝不入库
+certs/
+*.pem
+*.key
+*.csr
+.env
+.qiniu-sync-state.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
