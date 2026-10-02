@@ -1,0 +1,59 @@
+# 贡献指南
+
+感谢参与。这个项目很小，欢迎各种改进。
+
+## 可以贡献什么
+
+- **支持更多 DNS 服务商** —— 目前只做了 Cloudflare（`dns_cf`）。DNSPod、阿里云、腾讯云、
+  GoDaddy 等都可以加，换 acme.sh 的插件参数即可
+- **支持七牛源站域名与 CDN 域名区分配置** —— 目前两者用同一套 HTTPS 配置
+- **证书到期前的通知** —— 接 webhook、邮件、钉钉 / 飞书 / 企业微信机器人
+- **改成 Cloudflare 定时触发** —— 配合 Cloudflare Workers 也能做，不一定要用 Actions
+- **补充文档和踩坑记录** —— 尤其是报错排查部分
+
+## 提交前务必确认
+
+改动脚本后，本地跑一遍校验：
+
+```bash
+# 1. 语法与 import 完整性
+python3 -c "import ast; ast.parse(open('scripts/qiniu-cert-sync.py',encoding='utf-8').read()); print('语法 OK')"
+
+# 2. 模块能真正加载（能抓出漏掉的 import）
+python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('m','scripts/qiniu-cert-sync.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print('加载 OK')
+"
+
+# 3. workflow YAML 能解析
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/renew-ssl.yml',encoding='utf-8')); print('YAML OK')"
+```
+
+**改 workflow 后请务必跑第 3 条。** YAML 缩进或字符写错（比如 `- key` 打成 `- name`）
+不会在本地报错，但推上去之后 GitHub 直接解析失败，工作流整个不运行。
+
+## 不要做的事
+
+- ❌ 把任何真实密钥、token、域名写进代码或 workflow 文件
+- ❌ 删除 `actions/cache` 那一步（会导致 Let's Encrypt 速率限制）
+- ❌ 改动 `cleanup_old_certs` 里 `le-` 前缀的判断（会误删用户手动上传的证书）
+- ❌ 放宽 `check_expiry` 的 30 天下限（七牛硬性要求，不够会直接拒收）
+
+## 提交信息
+
+用中文或英文都可以，说清楚改了什么、为什么。类型参考：
+
+- `feat:` 新功能
+- `fix:` 修 bug
+- `docs:` 只改文档
+- `chore:` 杂项（依赖、配置）
+
+## 提问
+
+遇到问题开 Issue，附上：
+
+1. 你的 workflow 完整日志（**注意删掉域名和密钥**）
+2. 报错的具体行
+3. 你的 DNS 托管商和七牛空间所在区域

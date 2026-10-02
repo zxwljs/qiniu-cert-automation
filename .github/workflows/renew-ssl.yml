@@ -1,7 +1,7 @@
 name: Auto Renew SSL for Qiniu Kodo
 
-# 每天 03:17 UTC+0 (=北京时间 11:17) 检查一次，acme.sh 自己判断是否接近到期
-# GitHub Actions 的 cron 用 UTC，且整点常拥堵，故用非整点时间
+# 每天 UTC 03:17（北京时间 11:17）检查一次。
+# 用非整点是为了避开 GitHub Actions 整点的排队高峰 —— UTC 00:00 是最堵的时段。
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -11,6 +11,7 @@ on:
         description: "强制重新签发（调试用，忽略到期判断）"
         required: false
         default: "false"
+        type: boolean
 
 concurrency:
   group: qiniu-cert-renew
@@ -29,19 +30,22 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 OpenSSL
+      - name: 安装依赖
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq openssl ca-certificates curl
 
-      # 缓存 acme.sh 的账户目录：
-      # 关键点！不缓存会导致每次都重新签发，触发 Let's Encrypt 50 次/周 的速率限制
+      # 这一步绝对不能删！
+      # 没有缓存的话，每次运行都会重新签发一张证书，
+      # 很快触发 Let's Encrypt 的速率限制（同域名每周 50 次）然后被锁。
       - name: 缓存 acme.sh 账户目录
         uses: actions/cache@v4
         with:
           path: |
             ~/.acme.sh
             certs
+          # 用 run_id 做 key，保证每次运行都写入一份新缓存；
+          # restore-keys 让本次能取到最近一次的状态
           key: acme-qiniu-${{ github.run_id }}
           restore-keys: |
             acme-qiniu-
@@ -51,7 +55,6 @@ jobs:
           curl -s https://get.acme.sh | sh -s email=${{ secrets.ACME_EMAIL }}
           source ~/.acme.sh/acme.sh
           acme.sh --set-default-ca --server letsencrypt
-          echo "ACCOUNT_EMAIL=${{ secrets.ACME_EMAIL }}" >> "$GITHUB_ENV"
 
       - name: 签发 / 续签证书（Cloudflare DNS-01 挑战）
         env:
@@ -61,38 +64,59 @@ jobs:
         run: |
           set -euo pipefail
           source ~/.acme.sh/acme.sh
-          DOMAIN="${{ secrets.QINIU_DOMAIN }}"
-          CERT_DIR="$GITHUB_WORKSPACE/certs/$DOMAIN"
+
+          # 支持多个域名，逗号分隔
+          IFS=',' read -ra DOMAIN_LIST <<< "${{ secrets.QINIU_DOMAIN }}"
+          DOMAINS=()
+          for d in "${DOMAIN_LIST[@]}"; do
+            d="$(echo "$d" | tr -d '[:space:]')"
+            [ -n "$d" ] && DOMAINS+=("$d")
+          done
+          if [ ${#DOMAINS[@]} -eq 0 ]; then
+            echo "::error::QINIU_DOMAIN secret 为空或格式不对"
+            exit 1
+          fi
+
+          # 输出目录用第一个域名命名，保证同一仓库多次运行路径稳定
+          PRIMARY="${DOMAINS[0]}"
+          CERT_DIR="$GITHUB_WORKSPACE/certs/$PRIMARY"
           mkdir -p "$CERT_DIR"
 
-          # 先看看现在这张证书还剩多少天，方便排查
-          if acme.sh --list 2>/dev/null | grep -q "^$DOMAIN"; then
-            echo "已存在该域名的证书记录，acme.sh 将自动判断是否需要续签"
-          fi
+          echo "将申请的域名: ${DOMAINS[*]}"
+
+          # 拼出多个 -d 参数，一张证书覆盖所有域名
+          DOMAIN_ARGS=""
+          for d in "${DOMAINS[@]}"; do
+            DOMAIN_ARGS="$DOMAIN_ARGS -d $d"
+          done
 
           FORCE_FLAG=""
           if [ "${{ inputs.force_renew }}" = "true" ]; then
             FORCE_FLAG="--force"
+            echo "已启用强制重新签发"
           fi
 
+          # --server letsencrypt : 使用 Let's Encrypt 生产环境
+          # --dns dns_cf          : 用 Cloudflare API 自动写 _acme-challenge TXT 记录
+          # 不指定 --force 时，acme.sh 自己判断是否接近到期（默认剩余 30 天）
           acme.sh --issue \
             --server letsencrypt \
-            -d "$DOMAIN" \
+            $DOMAIN_ARGS \
             --dns dns_cf \
-            $FORCE_FLAG \
-            --log
+            $FORCE_FLAG
 
-          # 安装到固定路径，并挂上续签后的钩子
-          acme.sh --install-cert -d "$DOMAIN" \
+          # 装到固定路径，方便下游步骤引用
+          acme.sh --install-cert -d "$PRIMARY" \
             --fullchain-file "$CERT_DIR/fullchain.pem" \
-            --key-file "$CERT_DIR/privkey.pem" \
-            --reloadcmd "python3 $GITHUB_WORKSPACE/scripts/qiniu-cert-sync.py"
+            --key-file "$CERT_DIR/privkey.pem"
 
           echo "CERT_DIR=$CERT_DIR" >> "$GITHUB_ENV"
+          echo "PRIMARY_DOMAIN=$PRIMARY" >> "$GITHUB_ENV"
+          echo "--- 证书信息 ---"
           openssl x509 -in "$CERT_DIR/fullchain.pem" -noout -subject -issuer -dates
 
-      # 即使本次没触发续签（acme.sh 未执行 reloadcmd），也手动跑一次同步，
-      # 保证首次配置和上次同步失败的场景能被补上
+      # 这一步独立于是否触发续签。
+      # 首次配置、或上次同步失败需要补刀时，靠它兜住。
       - name: 同步证书到七牛云
         env:
           CERT_DIR: ${{ env.CERT_DIR }}
@@ -104,22 +128,20 @@ jobs:
           set -euo pipefail
           python3 scripts/qiniu-cert-sync.py
 
-      - name: 上传证书状态文件（供下次去重）
-        uses: actions/upload-artifact@v4
-        with:
-          name: cert-state
-          path: ${{ env.CERT_DIR }}/.qiniu-sync-state.json
-          retention-days: 90
-          if-no-files-found: ignore
-
       - name: 结果摘要
         if: always()
+        env:
+          PRIMARY_DOMAIN: ${{ env.PRIMARY_DOMAIN }}
         run: |
           {
-            echo "### 证书同步结果"
+            echo "## 证书同步结果"
             echo ""
-            echo "- 域名：\`${{ secrets.QINIU_DOMAIN }}\`"
-            echo "- 完成时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 主域名 | \`${{ env.PRIMARY_DOMAIN }}\` |"
+            echo "| 完成时间 | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |"
+            echo "| 运行状态 | ${{ job.status }} |"
             echo ""
-            echo "详细过程见上方日志。若状态为 ✅ 说明证书已成功换绑到七牛云。"
+            echo "详细过程见上方日志。日志里出现「跳过」是正常现象，"
+            echo "表示证书剩余有效期还充足，未触发续签。"
           } >> "$GITHUB_STEP_SUMMARY"
