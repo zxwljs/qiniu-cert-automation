@@ -42,7 +42,7 @@ python3 -c "import yaml; yaml.safe_load(open('.github/workflows/renew-ssl.yml',e
 - ❌ 放宽 `check_expiry` 的 30 天下限（七牛硬性要求，不够会直接拒收）
 - ❌ 在workflow 里 `source ~/.acme.sh/acme.sh` 然后调裸 `acme.sh` 命令
 
-## 两个已踩过的坑
+## 几个已踩过的坑
 
 **GitHub Actions 每个 step 都是独立 shell，不加载 `~/.bashrc`。**
 acme.sh 安装器只把别名写进 bashrc，所以 `acme.sh --xxx` 必然 `command not found`（exit 127）。
@@ -56,6 +56,17 @@ acme.sh 安装器只把别名写进 bashrc，所以 `acme.sh --xxx` 必然 `comm
 **不要给七牛的 `httpsconf` 接口传 `tlsVersions`。**
 文档写它是 `string`，但后端 Go 结构体是 `[]fusion.TlsVersion`，传字符串直接400。
 这是文档与实现不一致，不是我们的 bug。它是选填项，省掉即可。
+
+**`api.qiniu.com` 和 `api.qiniuapi.com` 是两个产品，不是一个东西。**
+前者是 **CDN**，后者是 **Kodo 存储**（七牛官方仓库 `qiniu/hadoop-kodo` 的区域配置里
+写着 `apiHost: api.qiniuapi.com`）。两者域名只差一个后缀，但源站域名打到 CDN 主机上
+只会得到 `612 no such domain`。而且鉴权也不同：Kodo 走 **QBox**，CDN 走 **Qiniu**。
+
+**别用假凭据探测来判断接口存不存在，401 是假的。**
+`api.qiniu.com` 上有 `/domain/{域名}/{任意动作}` 的通配路由，会**先鉴权再判断动作**，
+实测连 `/domain/xxx/zzz-garbage-action-999` 都返回 401。所以 401 只代表"域名这一级匹配上了"。
+真正能区分的是**用真凭据**打：`612` = 接口存在但域名不属于该产品，`404` = 接口不存在。
+`scripts/probe-qiniu-api.py` 里内置了对照组，就是为了自动识别这种假象。
 
 ## 提交信息
 
