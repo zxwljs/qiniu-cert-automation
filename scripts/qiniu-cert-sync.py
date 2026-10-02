@@ -257,30 +257,63 @@ def bind_cdn_domain(domain, cert_id):
     return api_write("PUT", path, payload, host=API_HOST)
 
 
-def bind_kodo_domain_sslcert(domain, cert_id):
-    """Kodo 源站域名换绑（/domain/{d}/sslcert 路径）。
+def _cert_payload(cert_id):
+    return {"certId": cert_id, "forceHttps": FORCE_HTTPS, "http2Enable": True}
 
-    经实测探测：uc.qiniuapi.com 的 /v6/domains/{d}/https 一律返回 404（路径不存在），
-    而 /domain/{d}/sslcert 在两个 host 上都返回 401（路径有效，只是本次凭据无效）。
+
+def _put_on(host, path, cert_id):
+    return api_write("PUT", path, _cert_payload(cert_id), host=host)
+
+
+def bind_cdn_httpsconf(domain, cert_id):
+    """CDN 加速域名换绑：PUT api.qiniu.com/domain/<d>/httpsconf
+
+    注意：刻意不传 tlsVersions。
+    七牛官方文档标注它是 string，但后端 Go 结构体实际是 []fusion.TlsVersion，
+    传字符串会报 "cannot unmarshal string into Go struct field"。
+    它是选填项，不传就走七牛默认策略。
     """
-    path = f"/domain/{domain}/sslcert"
-    payload = {"certId": cert_id, "forceHttps": FORCE_HTTPS, "http2Enable": True}
-    return api_write("PUT", path, payload, host=UC_HOST)
+    return _put_on(API_HOST, f"/domain/{domain}/httpsconf", cert_id)
 
 
-def bind_kodo_domain_sslcert_alt(domain, cert_id):
-    """同上，但走 api.qiniu.com（部分接口在此host 下的行为与 fusion 一致）。"""
-    path = f"/domain/{domain}/sslcert"
-    payload = {"certId": cert_id, "forceHttps": FORCE_HTTPS, "http2Enable": True}
-    return api_write("PUT", path, payload, host=API_HOST)
+def bind_cdn_sslize(domain, cert_id):
+    """开启 HTTPS 加速：PUT api.qiniu.com/domain/<d>/sslize"""
+    return _put_on(API_HOST, f"/domain/{domain}/sslize", cert_id)
 
 
-# 依次尝试的换绑策略：(说明, 函数)
-# 顺序 = 实测有效性排序。404 = 路径不存在，会立刻跳过，不浪费请求。
+def bind_domain_https(domain, cert_id):
+    """PUT api.qiniu.com/domain/<d>/https"""
+    return _put_on(API_HOST, f"/domain/{domain}/https", cert_id)
+
+
+def bind_domain_sslcert_fusion(domain, cert_id):
+    """PUT api.qiniu.com/domain/<d>/sslcert"""
+    return _put_on(API_HOST, f"/domain/{domain}/sslcert", cert_id)
+
+
+def bind_domain_sslcert_uc(domain, cert_id):
+    """PUT uc.qiniuapi.com/domain/<d>/sslcert"""
+    return _put_on(UC_HOST, f"/domain/{domain}/sslcert", cert_id)
+
+
+def bind_cdn_httpsconf_post(domain, cert_id):
+    """POST api.qiniu.com/domain/<d>/httpsconf（部分接口只接受 POST）"""
+    return api_write("POST", f"/domain/{domain}/httpsconf", _cert_payload(cert_id),
+                     host=API_HOST)
+
+
+# 全部经实测探测确认「路径存在」的换绑接口，按可能性排序。
+# 探测方法：用假凭据发请求，401/403 = 路径有效只是鉴权失败；404 = 路径不存在。
+#
+# 重要：七牛的 CDN 加速域名与 Kodo 源站域名是两套产品，接口不通用。
+# 脚本会依次尝试，任一成功即完成换绑。
 BIND_STRATEGIES = [
-    ("CDN 加速域名 api.qiniu.com/domain/{d}/httpsconf", bind_cdn_domain),
-    ("Kodo 源站域名 uc.qiniuapi.com/domain/{d}/sslcert", bind_kodo_domain_sslcert),
-    ("Kodo 源站域名 api.qiniu.com/domain/{d}/sslcert", bind_kodo_domain_sslcert_alt),
+    ("CDN httpsconf  api.qiniu.com/domain/{d}/httpsconf", bind_cdn_httpsconf),
+    ("CDN sslize     api.qiniu.com/domain/{d}/sslize", bind_cdn_sslize),
+    ("域名 https      api.qiniu.com/domain/{d}/https", bind_domain_https),
+    ("CDN httpsconf(POST) api.qiniu.com/domain/{d}/httpsconf", bind_cdn_httpsconf_post),
+    ("域名 sslcert    api.qiniu.com/domain/{d}/sslcert", bind_domain_sslcert_fusion),
+    ("源站 sslcert    uc.qiniuapi.com/domain/{d}/sslcert", bind_domain_sslcert_uc),
 ]
 
 
