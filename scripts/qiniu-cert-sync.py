@@ -132,11 +132,12 @@ def fusion_delete(path):
     return api_request(f"https://{FUSION_HOST}{path}", "DELETE", qbox_token(path))
 
 
-def api_write(method, path, payload):
+def api_write(method, path, payload, host=None):
+    host = host or API_HOST
     body = json.dumps(payload, separators=(",", ":"))
-    token, date_str = qiniu_token(method, API_HOST, path, "application/json", body)
+    token, date_str = qiniu_token(method, host, path, "application/json", body)
     return api_request(
-        f"https://{API_HOST}{path}",
+        f"https://{host}{path}",
         method,
         token,
         body,
@@ -236,13 +237,16 @@ def upload_cert(cert_pem, key_pem):
     return cert_id
 
 
-def bind_domain(domain, cert_id):
-    """把单个域名换绑到指定证书。
+UC_HOST = "uc.qiniuapi.com"           # Kodo 空间域名管理
 
-    注意：这里刻意不传 tlsVersions。
+
+def bind_cdn_domain(domain, cert_id):
+    """CDN 加速域名换绑：PUT api.qiniu.com/domain/<d>/httpsconf
+
+    注意：刻意不传 tlsVersions。
     七牛官方文档标注它是 string，但后端 Go 结构体实际是 []fusion.TlsVersion，
     传字符串会报 "cannot unmarshal string into Go struct field"。
-    反正它是选填项，不传就走七牛默认策略，少一个踩坑点。
+    它是选填项，不传就走七牛默认策略。
     """
     path = f"/domain/{domain}/httpsconf"
     payload = {
@@ -250,7 +254,46 @@ def bind_domain(domain, cert_id):
         "forceHttps": FORCE_HTTPS,
         "http2Enable": True,
     }
-    return api_write("PUT", path, payload)
+    return api_write("PUT", path, payload, host=API_HOST)
+
+
+def bind_kodo_domain_sslcert(domain, cert_id):
+    """Kodo 源站域名换绑（/domain/{d}/sslcert 路径）。
+
+    经实测探测：uc.qiniuapi.com 的 /v6/domains/{d}/https 一律返回 404（路径不存在），
+    而 /domain/{d}/sslcert 在两个 host 上都返回 401（路径有效，只是本次凭据无效）。
+    """
+    path = f"/domain/{domain}/sslcert"
+    payload = {"certId": cert_id, "forceHttps": FORCE_HTTPS, "http2Enable": True}
+    return api_write("PUT", path, payload, host=UC_HOST)
+
+
+def bind_kodo_domain_sslcert_alt(domain, cert_id):
+    """同上，但走 api.qiniu.com（部分接口在此host 下的行为与 fusion 一致）。"""
+    path = f"/domain/{domain}/sslcert"
+    payload = {"certId": cert_id, "forceHttps": FORCE_HTTPS, "http2Enable": True}
+    return api_write("PUT", path, payload, host=API_HOST)
+
+
+# 依次尝试的换绑策略：(说明, 函数)
+# 顺序 = 实测有效性排序。404 = 路径不存在，会立刻跳过，不浪费请求。
+BIND_STRATEGIES = [
+    ("CDN 加速域名 api.qiniu.com/domain/{d}/httpsconf", bind_cdn_domain),
+    ("Kodo 源站域名 uc.qiniuapi.com/domain/{d}/sslcert", bind_kodo_domain_sslcert),
+    ("Kodo 源站域名 api.qiniu.com/domain/{d}/sslcert", bind_kodo_domain_sslcert_alt),
+]
+
+
+def bind_one_domain(domain, cert_id):
+    """对单个域名依次尝试各接口，返回 (成功方式, 响应, 所有尝试的记录)。"""
+    attempts = []
+    for label, fn in BIND_STRATEGIES:
+        try:
+            res = fn(domain, cert_id)
+            return label, res, attempts
+        except Exception as e:
+            attempts.append(f"{label} -> {e}")
+    raise RuntimeError("所有接口都失败:\n      " + "\n      ".join(attempts))
 
 
 def bind_all_domains(cert_id):
@@ -258,19 +301,29 @@ def bind_all_domains(cert_id):
     ok, failed = [], []
     for domain in DOMAINS:
         try:
-            res = bind_domain(domain, cert_id)
-            log(f"  [OK] {domain} 换绑成功: {res}")
+            label, res, _ = bind_one_domain(domain, cert_id)
+            log(f"  [OK] {domain} 换绑成功（{label}）: {res}")
             ok.append(domain)
         except Exception as e:
             err = str(e)
-            # 4xx 基本都是配置错误（域名未备案、参数类型不对），重试没意义，
-            # 直接抛出去终止，避免日志里刷一堆无效重试
-            if err.startswith("HTTP 4"):
+            # 612 no such domain = 域名不在该产品下，换个接口也没用
+            # 400xxx = 域名/证书/参数问题，属于配置错误，重试无意义
+            fatal = "HTTP 612" in err or "HTTP 400" in err or "HTTP 401" in err
+            if fatal:
                 die(
-                    f"域名 {domain} 换绑被拒绝: {err}\n"
-                    f"  证书已成功上传（certID={cert_id}），但换绑失败。\n"
-                    f"  常见原因：域名未在七牛备案（400020）、域名没绑定过、或参数格式不对。\n"
-                    f"  注意：下次重跑时若证书指纹未变会跳过上传，直接重试换绑即可。"
+                    f"域名 {domain} 换绑失败:\n      {err}\n"
+                    f"  证书已成功上传（certID={cert_id}），但换绑失败。\n\n"
+                    f"  **七牛的对象存储（Kodo）源站域名很可能不支持 API 换绑** ——\n"
+                    f"  这是七牛的产品限制，脚本已尝试全部已知接口路径。\n\n"
+                    f"  手动换绑只需 30 秒（换绑后本项目仍会自动续签）：\n"
+                    f"   1. 七牛控制台 → SSL 证书服务 → 我的证书\n"
+                    f"      找到证书备注名以 le- 开头的（就是刚自动上传的这张）\n"
+                    f"   2. 进 Kodo → 空间管理 → 你的空间 → 域名管理\n"
+                    f"   3. 点你的域名 → 「配置 HTTPS」→ 开启 http/https\n"
+                    f"   4. 更换证书 → 下拉选刚才那张 le-* 证书 → 保存\n\n"
+                    f"  注意：证书 90 天后仍需手动换一次。若希望彻底自动化，\n"
+                    f"  可考虑改绑 CDN 加速域名（支持 API 换绑，本项目可直接接管）。\n\n"
+                    f"  下次重跑会复用 certID={cert_id} 直接重试换绑，不会重复上传证书。"
                 )
             log(f"  [FAIL] {domain} 换绑失败: {err}")
             failed.append((domain, err))
