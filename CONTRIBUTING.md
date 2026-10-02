@@ -40,6 +40,18 @@ python3 -c "import yaml; yaml.safe_load(open('.github/workflows/renew-ssl.yml',e
 - ❌ 删除 `actions/cache` 那一步（会导致 Let's Encrypt 速率限制）
 - ❌ 改动 `cleanup_old_certs` 里 `le-` 前缀的判断（会误删用户手动上传的证书）
 - ❌ 放宽 `check_expiry` 的 30 天下限（七牛硬性要求，不够会直接拒收）
+- ❌ 在workflow 里 `source ~/.acme.sh/acme.sh` 然后调裸 `acme.sh` 命令
+
+## 两个已踩过的坑
+
+**GitHub Actions 每个 step 都是独立 shell，不加载 `~/.bashrc`。**
+acme.sh 安装器只把别名写进 bashrc，所以 `acme.sh --xxx` 必然 `command not found`（exit 127）。
+正确做法是 `ACME="$HOME/.acme.sh/acme.sh"` + `"$ACME" --xxx`。
+而且 `source` 那个脚本本身就会执行整个 acme.sh（打印一大堆帮助信息），
+用绝对路径调用同时也避免了这个问题。
+
+**`set -euo pipefail` 环境下变量必须先赋值再用。**
+`ACME=...` 要写在 `set -e` 之后、`"$ACME"` 首次引用之前，否则 unbound variable 会直接中断。
 
 ## 提交信息
 
